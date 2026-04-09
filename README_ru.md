@@ -56,6 +56,30 @@
 
 ## Запуск
 
+## Быстрая установка
+
+Запуск напрямую с GitHub через `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+```
+
+Или через `wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+```
+
+Если хочется сначала посмотреть скрипт:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
+chmod +x deploy_amnezia_warp_host.sh
+sudo ./deploy_amnezia_warp_host.sh
+```
+
+## Запуск
+
 На VPS:
 
 ```bash
