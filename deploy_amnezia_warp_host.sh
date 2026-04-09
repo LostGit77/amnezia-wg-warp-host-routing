@@ -1,0 +1,998 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Interactive installer for routing AmneziaWG container egress through a host WARP
+# interface while keeping inbound services on the VPS IP.
+#
+# It supports:
+# - amnezia-awg   (legacy)
+# - amnezia-awg2  (v2)
+#
+# If no host WARP interface exists, it can install one via wgcf with Table=off,
+# so the host default route remains untouched.
+
+SCRIPT_NAME="$(basename "$0")"
+BASE_TABLE="${BASE_TABLE:-51820}"
+WARP_IF="${WARP_IF:-}"
+WAN_IF="${WAN_IF:-}"
+WAN_SUBNET="${WAN_SUBNET:-}"
+WAN_IP="${WAN_IP:-}"
+WARP_PROFILE_NAME="${WARP_PROFILE_NAME:-wgcf}"
+AUTO_YES="${AUTO_YES:-0}"
+ACTION="${1:-}"
+
+CONTAINERS_FOUND=()
+CONTAINER_SRC_IP=()
+DOCKER_IFS=()
+DOCKER_SUBNETS=()
+DOCKER_IPS=()
+AMN_IF=""
+AMN_SUBNET=""
+AMN_IP=""
+MENU_SELECTION=""
+MENU_ACTION=""
+COLOR=1
+
+if [[ ! -t 1 ]] || [[ "${TERM:-}" == "dumb" ]]; then
+  COLOR=0
+fi
+
+if [[ "${NO_COLOR:-}" == "1" ]]; then
+  COLOR=0
+fi
+
+if [[ "${COLOR}" == "1" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[36m'
+  C_RED=$'\033[31m'
+  C_GRAY=$'\033[90m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+  C_RED=""
+  C_GRAY=""
+fi
+
+log() {
+  printf '%s\n' "$*"
+}
+
+info() {
+  printf '%s%s%s\n' "${C_BLUE}" "$*" "${C_RESET}"
+}
+
+ok() {
+  printf '%s%s%s\n' "${C_GREEN}" "$*" "${C_RESET}"
+}
+
+warn() {
+  printf '%s%s%s\n' "${C_YELLOW}" "$*" "${C_RESET}"
+}
+
+state_text() {
+  local value="$1"
+  case "${value}" in
+    found|active)
+      printf '%s%s%s' "${C_GREEN}" "${value}" "${C_RESET}"
+      ;;
+    "not installed"|installed)
+      printf '%s%s%s' "${C_YELLOW}" "${value}" "${C_RESET}"
+      ;;
+    "not found"|inactive)
+      printf '%s%s%s' "${C_GRAY}" "${value}" "${C_RESET}"
+      ;;
+    *)
+      printf '%s' "${value}"
+      ;;
+  esac
+}
+
+die() {
+  printf '%sError:%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo bash deploy_amnezia_warp_host.sh
+  sudo AUTO_YES=1 bash deploy_amnezia_warp_host.sh
+  sudo bash deploy_amnezia_warp_host.sh uninstall
+  sudo bash deploy_amnezia_warp_host.sh status
+
+Environment overrides:
+  WARP_IF=wgcf
+  WARP_PROFILE_NAME=wgcf
+  WAN_IF=eth0
+  AUTO_YES=1
+EOF
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "run as root"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+have_iface() {
+  ip link show "$1" >/dev/null 2>&1
+}
+
+first_ipv4_on_iface() {
+  ip -4 -o addr show dev "$1" | awk 'NR==1 {print $4}'
+}
+
+first_ipv4_ip_on_iface() {
+  ip -4 -o addr show dev "$1" | awk 'NR==1 {split($4,a,"/"); print a[1]}'
+}
+
+cidr_to_network() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+print(ipaddress.ip_interface(sys.argv[1]).network)
+PY
+}
+
+get_container_ipv4s() {
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$1" 2>/dev/null \
+    | tr ' ' '\n' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+find_best_container_ip() {
+  local name="$1"
+  local ip
+  ip="$(get_container_ipv4s "$name" | grep '^172\.29\.' | head -n1 || true)"
+  if [[ -z "${ip}" ]]; then
+    ip="$(get_container_ipv4s "$name" | head -n1 || true)"
+  fi
+  [[ -n "${ip}" ]] || die "could not determine IPv4 for container ${name}"
+  printf '%s\n' "${ip}"
+}
+
+find_interface_for_ip() {
+  python3 - "$1" <<'PY'
+import ipaddress, subprocess, sys
+target = ipaddress.ip_address(sys.argv[1])
+out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "scope", "global"], text=True)
+for line in out.splitlines():
+    parts = line.split()
+    if len(parts) < 4:
+        continue
+    iface = parts[1]
+    if iface == "lo" or iface.startswith("veth"):
+        continue
+    cidr = parts[3]
+    net = ipaddress.ip_interface(cidr).network
+    if target in net:
+        print(f"{iface}|{net}|{ipaddress.ip_interface(cidr).ip}")
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+detect_containers() {
+  local name
+  CONTAINERS_FOUND=()
+  CONTAINER_SRC_IP=()
+  for name in amnezia-awg amnezia-awg2; do
+    if docker inspect "$name" >/dev/null 2>&1; then
+      CONTAINERS_FOUND+=("$name")
+      CONTAINER_SRC_IP+=("$(find_best_container_ip "$name")")
+    fi
+  done
+}
+
+routing_service_state() {
+  local suffix="$1"
+  local service_name="amnezia-warp-routing@${suffix}.service"
+  if systemctl is-active --quiet "${service_name}" 2>/dev/null; then
+    printf 'active\n'
+    return
+  fi
+  if [[ -f "/etc/amnezia-warp/${suffix}.env" ]] || systemctl is-enabled "${service_name}" >/dev/null 2>&1; then
+    printf 'installed\n'
+    return
+  fi
+  printf 'not installed\n'
+}
+
+detect_warp_if() {
+  local ifname
+  if [[ -n "${WARP_IF}" ]]; then
+    have_iface "${WARP_IF}" || die "WARP interface not found: ${WARP_IF}"
+    return
+  fi
+
+  while read -r ifname; do
+    [[ -n "${ifname}" ]] || continue
+    if [[ "${ifname}" == wg* ]]; then
+      WARP_IF="${ifname}"
+      return
+    fi
+  done < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1)
+}
+
+detect_wan() {
+  local cidr
+  if [[ -z "${WAN_IF}" ]]; then
+    WAN_IF="$(ip route show default 0.0.0.0/0 | awk 'NR==1 {print $5}')"
+  fi
+  [[ -n "${WAN_IF}" ]] || die "could not determine WAN interface"
+  have_iface "${WAN_IF}" || die "WAN interface not found: ${WAN_IF}"
+
+  if [[ -z "${WAN_IP}" ]]; then
+    WAN_IP="$(first_ipv4_ip_on_iface "${WAN_IF}")"
+  fi
+  [[ -n "${WAN_IP}" ]] || die "could not determine WAN IP"
+
+  if [[ -z "${WAN_SUBNET}" ]]; then
+    cidr="$(first_ipv4_on_iface "${WAN_IF}")"
+    [[ -n "${cidr}" ]] || die "could not determine WAN subnet"
+    WAN_SUBNET="$(cidr_to_network "${cidr}")"
+  fi
+}
+
+detect_docker_bridges() {
+  local line ifname cidr ip
+  DOCKER_IFS=()
+  DOCKER_SUBNETS=()
+  DOCKER_IPS=()
+
+  while read -r line; do
+    ifname="$(awk '{print $2}' <<<"${line}")"
+    cidr="$(awk '{print $4}' <<<"${line}")"
+    ip="${cidr%/*}"
+    [[ "${ifname}" == "${WAN_IF}" || "${ifname}" == "${WARP_IF}" ]] && continue
+    [[ "${ifname}" == "lo" ]] && continue
+    [[ "${ifname}" == veth* ]] && continue
+    [[ "${ifname}" == "docker0" || "${ifname}" == br-* ]] || continue
+    DOCKER_IFS+=("${ifname}")
+    DOCKER_SUBNETS+=("$(cidr_to_network "${cidr}")")
+    DOCKER_IPS+=("${ip}")
+  done < <(ip -4 -o addr show scope global)
+}
+
+ensure_amn_for_ip() {
+  local ip="$1"
+  local resolved
+
+  if [[ -n "${AMN_IF}" && -n "${AMN_SUBNET}" && -n "${AMN_IP}" ]]; then
+    return
+  fi
+
+  if have_iface amn0; then
+    AMN_IF="amn0"
+    AMN_IP="$(first_ipv4_ip_on_iface "${AMN_IF}")"
+    AMN_SUBNET="$(cidr_to_network "$(first_ipv4_on_iface "${AMN_IF}")")"
+    return
+  fi
+
+  resolved="$(find_interface_for_ip "${ip}")" || die "could not detect Amnezia bridge for ${ip}"
+  AMN_IF="${resolved%%|*}"
+  resolved="${resolved#*|}"
+  AMN_SUBNET="${resolved%%|*}"
+  AMN_IP="${resolved##*|}"
+}
+
+pkg_install() {
+  local packages=()
+
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    command -v curl >/dev/null 2>&1 || packages+=("curl")
+    command -v wget >/dev/null 2>&1 || packages+=("wget")
+    command -v tar >/dev/null 2>&1 || packages+=("tar")
+    command -v ip >/dev/null 2>&1 || packages+=("iproute2")
+    command -v iptables >/dev/null 2>&1 || packages+=("iptables")
+    command -v python3 >/dev/null 2>&1 || packages+=("python3")
+    command -v docker >/dev/null 2>&1 || packages+=("docker.io")
+    command -v wg >/dev/null 2>&1 || packages+=("wireguard-tools")
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+    fi
+    return
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    command -v curl >/dev/null 2>&1 || packages+=("curl")
+    command -v wget >/dev/null 2>&1 || packages+=("wget")
+    command -v tar >/dev/null 2>&1 || packages+=("tar")
+    command -v ip >/dev/null 2>&1 || packages+=("iproute")
+    command -v iptables >/dev/null 2>&1 || packages+=("iptables")
+    command -v python3 >/dev/null 2>&1 || packages+=("python3")
+    command -v docker >/dev/null 2>&1 || packages+=("docker")
+    command -v wg >/dev/null 2>&1 || packages+=("wireguard-tools")
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+      dnf install -y "${packages[@]}"
+    fi
+    return
+  fi
+  if command -v yum >/dev/null 2>&1; then
+    command -v curl >/dev/null 2>&1 || packages+=("curl")
+    command -v wget >/dev/null 2>&1 || packages+=("wget")
+    command -v tar >/dev/null 2>&1 || packages+=("tar")
+    command -v ip >/dev/null 2>&1 || packages+=("iproute")
+    command -v iptables >/dev/null 2>&1 || packages+=("iptables")
+    command -v python3 >/dev/null 2>&1 || packages+=("python3")
+    command -v docker >/dev/null 2>&1 || packages+=("docker")
+    command -v wg >/dev/null 2>&1 || packages+=("wireguard-tools")
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+      yum install -y "${packages[@]}"
+    fi
+    return
+  fi
+  die "unsupported package manager for automatic WARP install"
+}
+
+install_wgcf_binary() {
+  local arch release_json url tmpdir binpath
+  if command -v wgcf >/dev/null 2>&1; then
+    return
+  fi
+
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    armv7l|armv7) arch="armv7" ;;
+    *) die "unsupported architecture for wgcf: $(uname -m)" ;;
+  esac
+
+  release_json="$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest)"
+  url="$(RELEASE_JSON="${release_json}" python3 - "${arch}" <<'PY'
+import json, os, sys
+arch = sys.argv[1]
+data = json.loads(os.environ["RELEASE_JSON"])
+for asset in data.get("assets", []):
+    name = asset.get("name", "")
+    url = asset.get("browser_download_url", "")
+    if name.endswith(f"linux_{arch}") or f"linux_{arch}" in url:
+        print(url)
+        break
+else:
+    raise SystemExit(1)
+PY
+)"
+  [[ -n "${url}" ]] || die "could not find wgcf release for ${arch}"
+
+  tmpdir="$(mktemp -d)"
+  binpath="${tmpdir}/wgcf"
+  curl -fsSL "${url}" -o "${binpath}"
+  install -m 0755 "${binpath}" /usr/local/bin/wgcf
+  rm -rf "${tmpdir}"
+}
+
+ensure_warp_profile() {
+  local wgdir="/etc/wireguard"
+  local conf="${wgdir}/${WARP_PROFILE_NAME}.conf"
+  local account="${wgdir}/wgcf-account.toml"
+  local legacy_account="${HOME}/wgcf-account.toml"
+  local register_log
+
+  mkdir -p /etc/wireguard
+  chmod 700 "${wgdir}"
+
+  if [[ ! -f "${account}" && -f "${legacy_account}" ]]; then
+    mv "${legacy_account}" "${account}"
+  fi
+
+  if [[ ! -f "${account}" ]]; then
+    register_log="$(
+      cd "${wgdir}"
+      yes | wgcf register 2>&1 >/dev/null
+    )"
+  else
+    register_log="$(
+      cd "${wgdir}"
+      yes | wgcf register 2>&1 >/dev/null || true
+    )"
+    if [[ -n "${register_log}" ]] && ! grep -qi 'existing account detected' <<<"${register_log}"; then
+      printf '%s\n' "${register_log}" >&2
+      die "wgcf register failed"
+    fi
+  fi
+
+  if [[ ! -f "${conf}" ]]; then
+    rm -f "${wgdir}/wgcf-profile.conf"
+    (
+      cd "${wgdir}"
+      wgcf generate >/dev/null
+    )
+    [[ -f "${wgdir}/wgcf-profile.conf" ]] || die "wgcf generate did not create wgcf-profile.conf"
+    mv "${wgdir}/wgcf-profile.conf" "${conf}"
+  fi
+
+  sed -i '/^DNS = /d' "${conf}"
+  if ! grep -q '^Table = off$' "${conf}"; then
+    python3 - "${conf}" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+marker = "[Interface]\n"
+idx = text.find(marker)
+if idx == -1:
+    raise SystemExit("missing [Interface] section")
+insert_at = idx + len(marker)
+text = text[:insert_at] + "Table = off\n" + text[insert_at:]
+path.write_text(text)
+PY
+  fi
+}
+
+install_host_warp() {
+  local attempt
+  pkg_install
+  install_wgcf_binary
+  ensure_warp_profile
+  systemctl daemon-reload
+  systemctl enable "wg-quick@${WARP_PROFILE_NAME}.service" >/dev/null 2>&1 || true
+  systemctl restart "wg-quick@${WARP_PROFILE_NAME}.service"
+  WARP_IF="${WARP_PROFILE_NAME}"
+  for attempt in 1 2 3 4 5; do
+    if have_iface "${WARP_IF}"; then
+      return
+    fi
+    sleep 1
+  done
+  die "WARP interface did not come up: ${WARP_IF}"
+}
+
+mark_for_container() {
+  case "$1" in
+    amnezia-awg) printf '0x61\n' ;;
+    amnezia-awg2) printf '0x62\n' ;;
+    *) printf '0x66\n' ;;
+  esac
+}
+
+prio_for_container() {
+  case "$1" in
+    amnezia-awg) printf '10061\n' ;;
+    amnezia-awg2) printf '10062\n' ;;
+    *) printf '10066\n' ;;
+  esac
+}
+
+chain_for_container() {
+  case "$1" in
+    amnezia-awg) printf 'AMN_WARP_AWG\n' ;;
+    amnezia-awg2) printf 'AMN_WARP_AWG2\n' ;;
+    *) printf 'AMN_WARP_GENERIC\n' ;;
+  esac
+}
+
+service_suffix() {
+  case "$1" in
+    amnezia-awg) printf 'legacy\n' ;;
+    amnezia-awg2) printf 'v2\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+install_helper_template() {
+  cat > /usr/local/sbin/amnezia-warp-routing.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ACTION="${1:-up}"
+ENV_FILE="${2:-}"
+[[ -n "${ENV_FILE}" && -f "${ENV_FILE}" ]] || {
+  echo "usage: $0 [up|down] /path/to/envfile" >&2
+  exit 1
+}
+
+set -a
+. "${ENV_FILE}"
+set +a
+
+up() {
+  local route triplet subnet iface ip
+  local -a route_entries excludes
+
+  modprobe br_netfilter || true
+  sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null
+  sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null
+
+  ip route flush table "${TABLE}" 2>/dev/null || true
+  IFS=';' read -r -a route_entries <<<"${ROUTES}"
+  for triplet in "${route_entries[@]}"; do
+    [[ -n "${triplet}" ]] || continue
+    subnet="${triplet%%|*}"
+    triplet="${triplet#*|}"
+    iface="${triplet%%|*}"
+    ip="${triplet##*|}"
+    ip route add "${subnet}" dev "${iface}" src "${ip}" table "${TABLE}"
+  done
+  ip route add default dev "${WARP_IF}" table "${TABLE}"
+
+  ip rule del fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}" 2>/dev/null || true
+  ip rule add fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}"
+
+  iptables -t mangle -N "${CHAIN}" 2>/dev/null || true
+  iptables -t mangle -F "${CHAIN}"
+  iptables -t mangle -D PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -j "${CHAIN}" 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null || true
+
+  iptables -t mangle -A PREROUTING -j CONNMARK --restore-mark
+  iptables -t mangle -A PREROUTING -j "${CHAIN}"
+  iptables -t mangle -A PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark
+
+  IFS=' ' read -r -a excludes <<<"${EXCLUDES}"
+  for dst in "${excludes[@]}"; do
+    iptables -t mangle -A "${CHAIN}" -s "${SRC}" -d "${dst}" -j RETURN
+  done
+  iptables -t mangle -A "${CHAIN}" -s "${SRC}" -m conntrack --ctstate NEW -j MARK --set-mark "${MARK}"
+}
+
+down() {
+  iptables -t mangle -D PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -j "${CHAIN}" 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null || true
+  iptables -t mangle -F "${CHAIN}" 2>/dev/null || true
+  iptables -t mangle -X "${CHAIN}" 2>/dev/null || true
+  ip rule del fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}" 2>/dev/null || true
+}
+
+case "${ACTION}" in
+  up) up ;;
+  down) down ;;
+  *) echo "usage: $0 [up|down] /path/to/envfile" >&2; exit 1 ;;
+esac
+EOF
+  chmod 0755 /usr/local/sbin/amnezia-warp-routing.sh
+
+  cat > /etc/systemd/system/amnezia-warp-routing@.service <<'EOF'
+[Unit]
+Description=Route Amnezia container %i egress through host WARP
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/amnezia-warp/%i.env
+ExecStart=/usr/local/sbin/amnezia-warp-routing.sh up /etc/amnezia-warp/%i.env
+ExecStop=/usr/local/sbin/amnezia-warp-routing.sh down /etc/amnezia-warp/%i.env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/sysctl.d/99-amnezia-warp.conf <<'EOF'
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+EOF
+}
+
+build_routes_string() {
+  local routes=()
+  local i
+  routes+=("${WAN_SUBNET}|${WAN_IF}|${WAN_IP}")
+  for ((i=0; i<${#DOCKER_IFS[@]}; i++)); do
+    routes+=("${DOCKER_SUBNETS[$i]}|${DOCKER_IFS[$i]}|${DOCKER_IPS[$i]}")
+  done
+  routes+=("${AMN_SUBNET}|${AMN_IF}|${AMN_IP}")
+  local IFS=';'
+  printf '%s\n' "${routes[*]}"
+}
+
+configure_container() {
+  local name="$1"
+  local src_ip="$2"
+  local suffix mark prio chain env_file service_name routes excludes
+
+  ensure_amn_for_ip "${src_ip}"
+  suffix="$(service_suffix "${name}")"
+  mark="$(mark_for_container "${name}")"
+  prio="$(prio_for_container "${name}")"
+  chain="$(chain_for_container "${name}")"
+  routes="$(build_routes_string)"
+  excludes="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ${WAN_SUBNET} 100.64.0.0/10"
+
+  mkdir -p /etc/amnezia-warp
+  env_file="/etc/amnezia-warp/${suffix}.env"
+  service_name="amnezia-warp-routing@${suffix}.service"
+
+  cat > "${env_file}" <<EOF
+TABLE=${BASE_TABLE}
+MARK=${mark}
+PRIO=${prio}
+CHAIN=${chain}
+SRC=${src_ip}/32
+WARP_IF=${WARP_IF}
+ROUTES='${routes}'
+EXCLUDES='${excludes}'
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${service_name}" >/dev/null 2>&1 || true
+  systemctl restart "${service_name}"
+  log "Configured ${name} via ${service_name}"
+}
+
+container_ip_by_name() {
+  local i
+  for ((i=0; i<${#CONTAINERS_FOUND[@]}; i++)); do
+    if [[ "${CONTAINERS_FOUND[$i]}" == "$1" ]]; then
+      printf '%s\n' "${CONTAINER_SRC_IP[$i]}"
+      return
+    fi
+  done
+  return 1
+}
+
+menu_header() {
+  local warp_status legacy_status v2_status
+  legacy_status="not found"
+  v2_status="not found"
+  WARP_IF="${WARP_IF:-}"
+  detect_warp_if || true
+  detect_wan || true
+
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+    legacy_status="found"
+  fi
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+    v2_status="found"
+  fi
+  if [[ -n "${WARP_IF}" ]]; then
+    warp_status="found (${WARP_IF})"
+  else
+    warp_status="not found"
+  fi
+
+  printf '%s%sAmnezia WARP Host Routing%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
+  log
+  printf '%sEnvironment%s\n' "${C_BOLD}" "${C_RESET}"
+  log "  WAN interface: ${WAN_IF:-unknown}"
+  log "  WAN IP: ${WAN_IP:-unknown}"
+  log "  WAN subnet: ${WAN_SUBNET:-unknown}"
+  log "  WARP interface: ${WARP_IF:-not found}"
+  log "  Amnezia bridge: ${AMN_IF:-auto}"
+  log
+  printf '%sContainers%s\n' "${C_BOLD}" "${C_RESET}"
+  log "  AmneziaWG Legacy: $(state_text "${legacy_status}")"
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+    log "    container IP: $(container_ip_by_name amnezia-awg)"
+    log "    routing service: $(state_text "$(routing_service_state legacy)")"
+  fi
+  log "  AmneziaWG v2: $(state_text "${v2_status}")"
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+    log "    container IP: $(container_ip_by_name amnezia-awg2)"
+    log "    routing service: $(state_text "$(routing_service_state v2)")"
+  fi
+  log "  Host WARP: $(state_text "${warp_status}")"
+  printf '\n'
+}
+
+service_exists() {
+  local suffix="${1#amnezia-warp-routing@}"
+  suffix="${suffix%.service}"
+  [[ -f "/etc/amnezia-warp/${suffix}.env" ]] || systemctl is-enabled "$1" >/dev/null 2>&1
+}
+
+configured_service_names() {
+  local names=()
+  if [[ -f /etc/amnezia-warp/legacy.env ]] || service_exists "amnezia-warp-routing@legacy.service"; then
+    names+=("legacy")
+  fi
+  if [[ -f /etc/amnezia-warp/v2.env ]] || service_exists "amnezia-warp-routing@v2.service"; then
+    names+=("v2")
+  fi
+  printf '%s\n' "${names[@]}"
+}
+
+disable_container_service() {
+  local suffix="$1"
+  local service_name="amnezia-warp-routing@${suffix}.service"
+  if systemctl list-unit-files "${service_name}" --no-legend 2>/dev/null | grep -q "^${service_name}"; then
+    systemctl disable --now "${service_name}" >/dev/null 2>&1 || true
+  else
+    systemctl stop "${service_name}" >/dev/null 2>&1 || true
+  fi
+  rm -f "/etc/amnezia-warp/${suffix}.env"
+}
+
+cleanup_shared_files() {
+  local remaining
+  remaining="$(find /etc/amnezia-warp -maxdepth 1 -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${remaining}" == "0" ]]; then
+    rm -rf /etc/amnezia-warp
+    rm -f /usr/local/sbin/amnezia-warp-routing.sh
+    rm -f /etc/systemd/system/amnezia-warp-routing@.service
+    rm -f /etc/sysctl.d/99-amnezia-warp.conf
+    systemctl daemon-reload
+  fi
+}
+
+uninstall_host_warp() {
+  local other_suffixes
+  other_suffixes="$(configured_service_names | tr '\n' ' ' | xargs 2>/dev/null || true)"
+  if [[ -n "${other_suffixes}" ]]; then
+    warn "Host-level WARP was left in place because other routed containers still exist."
+    return
+  fi
+
+  if systemctl list-unit-files "wg-quick@${WARP_PROFILE_NAME}.service" --no-legend 2>/dev/null | grep -q "^wg-quick@${WARP_PROFILE_NAME}\.service"; then
+    systemctl stop "wg-quick@${WARP_PROFILE_NAME}.service" >/dev/null 2>&1 || true
+    systemctl disable "wg-quick@${WARP_PROFILE_NAME}.service" >/dev/null 2>&1 || true
+  fi
+  have_iface "${WARP_PROFILE_NAME}" && ip link delete "${WARP_PROFILE_NAME}" >/dev/null 2>&1 || true
+  rm -f "/etc/wireguard/${WARP_PROFILE_NAME}.conf"
+  rm -f "/etc/wireguard/wgcf-account.toml"
+  rm -f /usr/local/bin/wgcf
+}
+
+uninstall_selection() {
+  local selection="$1"
+
+  case "${selection}" in
+    all)
+      disable_container_service legacy
+      disable_container_service v2
+      cleanup_shared_files
+      uninstall_host_warp
+      ;;
+    legacy)
+      disable_container_service legacy
+      cleanup_shared_files
+      uninstall_host_warp
+      ;;
+    v2)
+      disable_container_service v2
+      cleanup_shared_files
+      uninstall_host_warp
+      ;;
+    *)
+      die "unknown uninstall selection: ${selection}"
+      ;;
+  esac
+
+  log
+  ok "Removal completed."
+}
+
+run_uninstall() {
+  local selection="$1"
+  case "${selection}" in
+    all|legacy|v2)
+      uninstall_selection "${selection}"
+      ;;
+    warp-only)
+      uninstall_host_warp
+      log
+      ok "Removal completed."
+      ;;
+    exit)
+      log "No changes made."
+      ;;
+    *)
+      die "unknown uninstall selection: ${selection}"
+      ;;
+  esac
+}
+
+show_status() {
+  local suffix
+  menu_header
+  if systemctl is-active --quiet "wg-quick@${WARP_PROFILE_NAME}.service" 2>/dev/null; then
+    log "Host WARP service: active (wg-quick@${WARP_PROFILE_NAME}.service)"
+  else
+    log "Host WARP service: inactive"
+  fi
+  for suffix in legacy v2; do
+    if systemctl is-active --quiet "amnezia-warp-routing@${suffix}.service" 2>/dev/null; then
+      log "Routing service ${suffix}: active"
+    elif systemctl list-unit-files "amnezia-warp-routing@${suffix}.service" --no-legend 2>/dev/null | grep -q "^amnezia-warp-routing@${suffix}\.service"; then
+      log "Routing service ${suffix}: installed but inactive"
+    fi
+  done
+  log
+  printf '%sDebug%s\n' "${C_BOLD}" "${C_RESET}"
+  log "  Kernel: $(uname -r)"
+  log "  Hostname: $(hostname)"
+  log "  Docker version: $(docker --version 2>/dev/null || echo unknown)"
+  log "  Default route: $(ip route show default 2>/dev/null | head -n1 || echo unknown)"
+  if [[ -n "${WARP_IF}" ]] && have_iface "${WARP_IF}"; then
+    log "  WARP link: $(ip -brief link show "${WARP_IF}" 2>/dev/null | tr -s ' ' || echo unknown)"
+  else
+    log "  WARP link: not present"
+  fi
+  if [[ -d /etc/amnezia-warp ]]; then
+    log "  Env files:"
+    find /etc/amnezia-warp -maxdepth 1 -type f -name '*.env' -printf '    %f\n' 2>/dev/null || true
+  fi
+  log "  Policy rules:"
+  ip rule show 2>/dev/null | grep -E '10061|10062|10066' | sed 's/^/    /' || log "    none"
+  log "  Routing table ${BASE_TABLE}:"
+  ip route show table "${BASE_TABLE}" 2>/dev/null | sed 's/^/    /' || log "    empty"
+}
+
+prompt_menu_choice() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  local idx choice
+
+  for ((idx=0; idx<${#options[@]}; idx++)); do
+    printf '%s%d)%s %s\n' "${C_BOLD}" "$((idx + 1))" "${C_RESET}" "${options[$idx]}"
+  done
+
+  while true; do
+    printf '%s' "${prompt}"
+    IFS= read -r choice
+    [[ "${choice}" =~ ^[0-9]+$ ]] || {
+      warn "Please enter a number from the menu."
+      continue
+    }
+    if (( choice >= 1 && choice <= ${#options[@]} )); then
+      MENU_SELECTION="${options[$((choice - 1))]}"
+      return
+    fi
+    warn "Please choose one of the listed actions."
+  done
+}
+
+choose_main_action() {
+  local options=()
+  local labels=()
+  local configured=()
+  local suffix
+
+  while read -r suffix; do
+    [[ -n "${suffix}" ]] && configured+=("${suffix}")
+  done < <(configured_service_names)
+
+  if [[ "${#CONTAINERS_FOUND[@]}" -eq 0 ]]; then
+    die "no amnezia-awg or amnezia-awg2 containers were found"
+  fi
+
+  labels+=("install:all")
+  options+=("Install WARP and route all detected containers")
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+    labels+=("install:legacy")
+    options+=("Install or refresh routing for AWG Legacy only")
+  fi
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+    labels+=("install:v2")
+    options+=("Install or refresh routing for AWG v2 only")
+  fi
+  if [[ "${#configured[@]}" -gt 0 ]]; then
+    labels+=("remove:all")
+    options+=("Remove everything configured by this script")
+    if printf '%s\n' "${configured[@]}" | grep -qx 'legacy'; then
+      labels+=("remove:legacy")
+      options+=("Remove AWG Legacy routing")
+    fi
+    if printf '%s\n' "${configured[@]}" | grep -qx 'v2'; then
+      labels+=("remove:v2")
+      options+=("Remove AWG v2 routing")
+    fi
+  elif [[ -n "${WARP_IF}" ]]; then
+    labels+=("remove:warp-only")
+    options+=("Remove host-level WARP only")
+  fi
+  labels+=("status")
+  options+=("Show status")
+  labels+=("exit")
+  options+=("Exit")
+
+  local idx
+  prompt_menu_choice "Choose an action: " "${options[@]}"
+  for ((idx=0; idx<${#options[@]}; idx++)); do
+    if [[ "${options[$idx]}" == "${MENU_SELECTION}" ]]; then
+      MENU_ACTION="${labels[$idx]}"
+      return
+    fi
+  done
+  die "menu selection resolution failed"
+}
+
+run_selection() {
+  local selection="$1"
+  detect_wan
+  detect_docker_bridges
+  install_helper_template
+
+  if [[ -z "${WARP_IF}" ]]; then
+    warn "Host-level WARP was not found. Bootstrapping it with wgcf."
+    install_host_warp
+  fi
+
+  case "${selection}" in
+    all)
+      if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+        configure_container "amnezia-awg" "$(container_ip_by_name amnezia-awg)"
+      fi
+      if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+        configure_container "amnezia-awg2" "$(container_ip_by_name amnezia-awg2)"
+      fi
+      ;;
+    legacy)
+      configure_container "amnezia-awg" "$(container_ip_by_name amnezia-awg)"
+      ;;
+    v2)
+      configure_container "amnezia-awg2" "$(container_ip_by_name amnezia-awg2)"
+      ;;
+    exit)
+      log "No changes made."
+      return
+      ;;
+    *)
+      die "unknown selection: ${selection}"
+      ;;
+  esac
+
+  log
+  ok "Routing is configured."
+  log "Verification:"
+  log "  Open any IP / ISP lookup site from a VPN-connected client."
+  log "  Examples: myip.com, 2ip.io, whatismyipaddress.com, whatismyisp.com, dnschecker.org"
+  log "  You should see a Cloudflare-owned IP instead of the VPS IP."
+}
+
+main() {
+  require_root
+  require_cmd ip
+  require_cmd iptables
+  require_cmd docker
+  require_cmd python3
+  require_cmd systemctl
+
+  case "${ACTION}" in
+    -h|--help|help)
+      usage
+      return
+      ;;
+  esac
+
+  detect_containers
+  if [[ "${ACTION}" == "status" ]]; then
+    show_status
+    return
+  fi
+
+  if [[ "${ACTION}" == "uninstall" ]]; then
+    menu_header
+    if [[ "${AUTO_YES}" == "1" ]]; then
+      run_uninstall "all"
+    else
+      choose_main_action
+      run_uninstall "${MENU_ACTION#remove:}"
+    fi
+    return
+  fi
+
+  while true; do
+    menu_header
+
+    if [[ "${AUTO_YES}" == "1" ]]; then
+      run_selection "all"
+      return
+    fi
+
+    choose_main_action
+    case "${MENU_ACTION}" in
+      install:all) run_selection "all"; return ;;
+      install:legacy) run_selection "legacy"; return ;;
+      install:v2) run_selection "v2"; return ;;
+      remove:all) run_uninstall "all"; return ;;
+      remove:legacy) run_uninstall "legacy"; return ;;
+      remove:v2) run_uninstall "v2"; return ;;
+      remove:warp-only) run_uninstall "warp-only"; return ;;
+      status) show_status ;;
+      exit) log "No changes made."; return ;;
+      *) die "unknown selection" ;;
+    esac
+  done
+}
+
+main "$@"
