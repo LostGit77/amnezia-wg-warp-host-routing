@@ -1,3 +1,7 @@
 .DS_Store
 Thumbs.db
 *.log
+__pycache__/
+*.pyc
+awg-manager/.env
+awg-manager/config/servers.json

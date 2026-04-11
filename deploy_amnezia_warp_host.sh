@@ -81,6 +81,9 @@ state_text() {
     found|active)
       printf '%s%s%s' "${C_GREEN}" "${value}" "${C_RESET}"
       ;;
+    failed|stale)
+      printf '%s%s%s' "${C_RED}" "${value}" "${C_RESET}"
+      ;;
     "not installed"|installed)
       printf '%s%s%s' "${C_YELLOW}" "${value}" "${C_RESET}"
       ;;
@@ -91,6 +94,22 @@ state_text() {
       printf '%s' "${value}"
       ;;
   esac
+}
+
+host_warp_unit_state() {
+  if systemctl is-active --quiet "wg-quick@${WARP_PROFILE_NAME}.service" 2>/dev/null; then
+    if [[ -n "${WARP_IF}" ]] && have_iface "${WARP_IF}"; then
+      printf 'active\n'
+    else
+      printf 'stale\n'
+    fi
+    return
+  fi
+  if systemctl is-enabled "wg-quick@${WARP_PROFILE_NAME}.service" >/dev/null 2>&1 || [[ -f "/etc/wireguard/${WARP_PROFILE_NAME}.conf" ]]; then
+    printf 'installed\n'
+    return
+  fi
+  printf 'inactive\n'
 }
 
 die() {
@@ -196,6 +215,10 @@ routing_service_state() {
   local service_name="amnezia-warp-routing@${suffix}.service"
   if systemctl is-active --quiet "${service_name}" 2>/dev/null; then
     printf 'active\n'
+    return
+  fi
+  if systemctl is-failed --quiet "${service_name}" 2>/dev/null; then
+    printf 'failed\n'
     return
   fi
   if [[ -f "/etc/amnezia-warp/${suffix}.env" ]] || systemctl is-enabled "${service_name}" >/dev/null 2>&1; then
@@ -386,12 +409,12 @@ ensure_warp_profile() {
   if [[ ! -f "${account}" ]]; then
     register_log="$(
       cd "${wgdir}"
-      yes | wgcf register 2>&1 >/dev/null
+      (yes || true) | wgcf register >/dev/null 2>&1
     )"
   else
     register_log="$(
       cd "${wgdir}"
-      yes | wgcf register 2>&1 >/dev/null || true
+      ((yes || true) | wgcf register >/dev/null 2>&1) || true
     )"
     if [[ -n "${register_log}" ]] && ! grep -qi 'existing account detected' <<<"${register_log}"; then
       printf '%s\n' "${register_log}" >&2
@@ -508,9 +531,9 @@ up() {
     triplet="${triplet#*|}"
     iface="${triplet%%|*}"
     ip="${triplet##*|}"
-    ip route add "${subnet}" dev "${iface}" src "${ip}" table "${TABLE}"
+    ip route replace "${subnet}" dev "${iface}" src "${ip}" table "${TABLE}"
   done
-  ip route add default dev "${WARP_IF}" table "${TABLE}"
+  ip route replace default dev "${WARP_IF}" table "${TABLE}"
 
   ip rule del fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}" 2>/dev/null || true
   ip rule add fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}"
@@ -552,8 +575,8 @@ EOF
   cat > /etc/systemd/system/amnezia-warp-routing@.service <<'EOF'
 [Unit]
 Description=Route Amnezia container %i egress through host WARP
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=network-online.target docker.service wg-quick@WGCF_PROFILE.service
+Wants=network-online.target docker.service wg-quick@WGCF_PROFILE.service
 
 [Service]
 Type=oneshot
@@ -565,6 +588,7 @@ ExecStop=/usr/local/sbin/amnezia-warp-routing.sh down /etc/amnezia-warp/%i.env
 [Install]
 WantedBy=multi-user.target
 EOF
+  sed -i "s/WGCF_PROFILE/${WARP_PROFILE_NAME}/g" /etc/systemd/system/amnezia-warp-routing@.service
 
   cat > /etc/sysctl.d/99-amnezia-warp.conf <<'EOF'
 net.bridge.bridge-nf-call-iptables=1
@@ -784,15 +808,22 @@ show_status() {
   local suffix
   menu_header
   if systemctl is-active --quiet "wg-quick@${WARP_PROFILE_NAME}.service" 2>/dev/null; then
-    log "Host WARP service: active (wg-quick@${WARP_PROFILE_NAME}.service)"
+    if [[ -n "${WARP_IF}" ]] && have_iface "${WARP_IF}"; then
+      log "Host WARP service: $(state_text "active") (wg-quick@${WARP_PROFILE_NAME}.service)"
+    else
+      log "Host WARP service: $(state_text "installed") but link is missing (wg-quick@${WARP_PROFILE_NAME}.service)"
+      warn "  Hint: run uninstall once to clean the stale WARP unit, then install again."
+    fi
   else
-    log "Host WARP service: inactive"
+    log "Host WARP service: $(state_text "$(host_warp_unit_state)")"
   fi
   for suffix in legacy v2; do
     if systemctl is-active --quiet "amnezia-warp-routing@${suffix}.service" 2>/dev/null; then
-      log "Routing service ${suffix}: active"
+      log "Routing service ${suffix}: $(state_text "active")"
+    elif systemctl is-failed --quiet "amnezia-warp-routing@${suffix}.service" 2>/dev/null; then
+      log "Routing service ${suffix}: $(state_text "failed")"
     elif systemctl list-unit-files "amnezia-warp-routing@${suffix}.service" --no-legend 2>/dev/null | grep -q "^amnezia-warp-routing@${suffix}\.service"; then
-      log "Routing service ${suffix}: installed but inactive"
+      log "Routing service ${suffix}: $(state_text "installed") but inactive"
     fi
   done
   log
@@ -806,6 +837,7 @@ show_status() {
   else
     log "  WARP link: not present"
   fi
+  log "  WARP unit state: $(state_text "$(host_warp_unit_state)")"
   if [[ -d /etc/amnezia-warp ]]; then
     log "  Env files:"
     find /etc/amnezia-warp -maxdepth 1 -type f -name '*.env' -printf '    %f\n' 2>/dev/null || true
@@ -905,6 +937,7 @@ run_selection() {
   if [[ -z "${WARP_IF}" ]]; then
     warn "Host-level WARP was not found. Bootstrapping it with wgcf."
     install_host_warp
+    detect_warp_if || true
   fi
 
   case "${selection}" in
