@@ -59,19 +59,19 @@ For automatic WARP bootstrap through `wgcf`:
 Run directly from GitHub with `curl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
 Or with `wget`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
 If you prefer to inspect the script before running it:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
+curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
 chmod +x deploy_amnezia_warp_host.sh
 sudo ./deploy_amnezia_warp_host.sh
 ```
