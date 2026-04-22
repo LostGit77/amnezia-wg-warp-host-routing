@@ -13,6 +13,12 @@
 
 Это удобно, когда нужно сохранить VPS как входную точку для VPN, но скрыть IP сервера для исходящего трафика клиентов.
 
+## Запуск
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh && chmod +x deploy_amnezia_warp_host.sh && sudo ./deploy_amnezia_warp_host.sh
+```
+
 ## Как это работает под капотом
 
 Скрипт делает четыре вещи:
@@ -54,11 +60,6 @@
 - Ubuntu/Debian, RHEL-family или другой дистрибутив с поддерживаемым пакетным менеджером
 - исходящий доступ к GitHub и Cloudflare
 
-## Запуск
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh && chmod +x deploy_amnezia_warp_host.sh && sudo ./deploy_amnezia_warp_host.sh
-```
 
 Типичный вид меню:
 
@@ -170,7 +171,7 @@ sudo WARP_IF=wg0 WAN_IF=ens34 ./deploy_amnezia_warp_host.sh
 
 Issues и pull requests приветствуются, но поддержку я смотрю по возможности. Ревью и ответы могут быть небыстрыми, потому что это не фуллтайм-поддержка.
 
-## Бекап перед запуском
+## Бекап перед запуском (полный снапшот всех сетевых правил)
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/backup/backup_warp.sh && chmod +x backup_warp.sh && sudo ./backup_warp.sh
 ```
