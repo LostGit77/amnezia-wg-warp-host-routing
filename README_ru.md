@@ -56,35 +56,8 @@
 
 ## Запуск
 
-## Быстрая установка
-
-Запуск напрямую с GitHub через `curl`:
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
-```
-
-Или через `wget`:
-
-```bash
-wget -qO- https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
-```
-
-Если хочется сначала посмотреть скрипт:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
-chmod +x deploy_amnezia_warp_host.sh
-sudo ./deploy_amnezia_warp_host.sh
-```
-
-## Запуск
-
-На VPS:
-
-```bash
-chmod +x deploy_amnezia_warp_host.sh
-sudo ./deploy_amnezia_warp_host.sh
+curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh && chmod +x deploy_amnezia_warp_host.sh && sudo ./deploy_amnezia_warp_host.sh
 ```
 
 Типичный вид меню:
@@ -196,3 +169,12 @@ sudo WARP_IF=wg0 WAN_IF=ens34 ./deploy_amnezia_warp_host.sh
 Проект публикуется как `as-is`.
 
 Issues и pull requests приветствуются, но поддержку я смотрю по возможности. Ревью и ответы могут быть небыстрыми, потому что это не фуллтайм-поддержка.
+
+## Бекап перед запуском
+```bash
+curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/backup/backup_warp.sh && chmod +x backup_warp.sh && sudo ./backup_warp.sh
+```
+## Восстановление бекапа
+```bash
+curl -fsSLO https://raw.githubusercontent.com/LostGit77/amnezia-wg-warp-host-routing/refs/heads/master/backup/restore_warp.sh && chmod +x restore_warp.sh && sudo ./restore_warp.sh
+```
